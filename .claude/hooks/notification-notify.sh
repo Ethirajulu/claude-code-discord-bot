@@ -1,63 +1,58 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────
 # Claude Code Notification Hook → Discord Alert
-#
-# Fires when Claude Code needs your attention:
-#   - Permission prompt (needs approval for a tool)
-#   - Idle prompt (waiting for your input for 60+ seconds)
-#
-# This pings you on Discord so you can respond from your phone.
+# Fires when Claude needs permission or is idle 60+ seconds.
 # ─────────────────────────────────────────────────────────
 
-if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
-  exit 0
-fi
-
 INPUT=$(cat)
+
+WEBHOOK_URL="${DISCORD_WEBHOOK_URL}"
+[ -z "$WEBHOOK_URL" ] && exit 0
 
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // "unknown"')
 CWD=$(echo "$INPUT" | jq -r '.cwd // "unknown"')
 MESSAGE=$(echo "$INPUT" | jq -r '.message // "Claude needs your attention"')
-HOOK_EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // "Notification"')
 
 PROJECT_NAME=$(basename "$CWD")
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
-# Determine notification type and color
+# Pick color and title based on notification type
 if echo "$MESSAGE" | grep -qi "permission"; then
   TITLE="🔐 Claude Needs Permission"
-  COLOR=16776960  # Yellow
+  COLOR=16776960
 elif echo "$MESSAGE" | grep -qi "idle\|waiting\|input"; then
   TITLE="⏳ Claude is Waiting for Input"
-  COLOR=15105570  # Orange
+  COLOR=15105570
 else
   TITLE="🔔 Claude Needs Attention"
-  COLOR=3447003   # Blue
+  COLOR=3447003
 fi
 
-# Escape message for JSON
-MESSAGE_ESCAPED=$(echo "$MESSAGE" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+PAYLOAD=$(jq -n \
+  --arg title "$TITLE" \
+  --arg message "$MESSAGE" \
+  --argjson color "$COLOR" \
+  --arg project "$PROJECT_NAME" \
+  --arg session_short "${SESSION_ID:0:12}..." \
+  --arg cwd "$CWD" \
+  --arg timestamp "$TIMESTAMP" \
+  --arg user_id "${ALLOWED_USER_ID:-}" \
+  '{
+    content: (if $user_id != "" then ("<@" + $user_id + ">") else null end),
+    username: "Claude Code",
+    embeds: [{
+      title: $title,
+      description: $message,
+      color: $color,
+      fields: [
+        { name: "📁 Project", value: $project, inline: true },
+        { name: "🔑 Session", value: $session_short, inline: true },
+        { name: "📂 Directory", value: ("`" + $cwd + "`"), inline: false }
+      ],
+      footer: { text: $timestamp }
+    }]
+  }')
 
-PAYLOAD=$(cat <<EOF
-{
-  "content": "<@$ALLOWED_USER_ID>",
-  "embeds": [{
-    "title": "$TITLE",
-    "description": "$MESSAGE_ESCAPED",
-    "color": $COLOR,
-    "fields": [
-      { "name": "📁 Project", "value": "\`$PROJECT_NAME\`", "inline": true },
-      { "name": "🔑 Session", "value": "\`${SESSION_ID:0:12}...\`", "inline": true },
-      { "name": "📂 Directory", "value": "\`$CWD\`", "inline": false }
-    ],
-    "footer": { "text": "$TIMESTAMP" }
-  }]
-}
-EOF
-)
-
-curl -s -o /dev/null -X POST "$DISCORD_WEBHOOK_URL" \
-  -H "Content-Type: application/json" \
-  -d "$PAYLOAD"
+curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK_URL" > /dev/null 2>&1 &
 
 exit 0

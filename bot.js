@@ -2,13 +2,9 @@ const {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
   Events,
 } = require("discord.js");
 const { spawn } = require("child_process");
-const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
 
@@ -17,7 +13,6 @@ const CONFIG = {
   token: process.env.DISCORD_BOT_TOKEN,
   allowedUserId: process.env.ALLOWED_USER_ID,
   channelId: process.env.NOTIFICATION_CHANNEL_ID || null,
-  webhookUrl: process.env.DISCORD_WEBHOOK_URL || null,
   passphrase: process.env.BOT_PASSPHRASE || null,
   autoLockMinutes: parseInt(process.env.AUTO_LOCK_MINUTES) || 15,
   maxQueueSize: parseInt(process.env.MAX_QUEUE_SIZE) || 5,
@@ -34,11 +29,10 @@ if (!CONFIG.allowedUserId || CONFIG.allowedUserId === "your_user_id_here") {
 }
 
 // ─── Session Tracker ─────────────────────────────────────
-// Tracks active Claude Code sessions reported by hooks
 class SessionTracker {
   constructor() {
-    this.sessions = new Map(); // sessionId -> { cwd, branch, project, lastSeen, messageCount }
-    this.activeSession = null; // Most recently active session ID
+    this.sessions = new Map();
+    this.activeSession = null;
   }
 
   track(sessionId, cwd, extra = {}) {
@@ -128,11 +122,11 @@ class PromptQueue {
   }
 }
 
-// ─── Security: Passphrase Lock ───────────────────────────
+// ─── Security Lock ───────────────────────────────────────
 class SecurityLock {
   constructor(passphrase, autoLockMinutes) {
     this.passphrase = passphrase;
-    this.unlocked = !passphrase; // If no passphrase, always unlocked
+    this.unlocked = !passphrase;
     this.lastActivity = Date.now();
     this.autoLockMs = autoLockMinutes * 60 * 1000;
 
@@ -144,9 +138,10 @@ class SecurityLock {
   isUnlocked() {
     if (!this.passphrase) return true;
     if (!this.unlocked) return false;
-
-    // Check auto-lock timeout
-    if (this.autoLockMs > 0 && Date.now() - this.lastActivity > this.autoLockMs) {
+    if (
+      this.autoLockMs > 0 &&
+      Date.now() - this.lastActivity > this.autoLockMs
+    ) {
       this.unlocked = false;
       return false;
     }
@@ -171,7 +166,11 @@ class SecurityLock {
   }
 
   checkAutoLock() {
-    if (this.unlocked && this.autoLockMs > 0 && Date.now() - this.lastActivity > this.autoLockMs) {
+    if (
+      this.unlocked &&
+      this.autoLockMs > 0 &&
+      Date.now() - this.lastActivity > this.autoLockMs
+    ) {
       this.unlocked = false;
       console.log("🔒 Auto-locked due to inactivity");
     }
@@ -179,13 +178,13 @@ class SecurityLock {
 }
 
 // ─── Claude Code Runner ──────────────────────────────────
-function runClaudeResume(prompt, sessionId, cwd, timeoutSeconds) {
+// Uses --continue instead of --resume because -p --resume has a confirmed bug
+// (GitHub #1967). --continue picks up the most recent session in the given cwd.
+function runClaudeContinue(prompt, cwd, timeoutSeconds) {
   return new Promise((resolve, reject) => {
-    const args = ["-p", prompt, "--output-format", "json"];
-
-    if (sessionId) {
-      args.push("--resume", sessionId);
-    }
+    // -c = --continue (most recent session in this directory)
+    // -p = print/headless mode (non-interactive)
+    const args = ["-c", "-p", prompt, "--output-format", "json"];
 
     console.log(`▶ Running: claude ${args.join(" ")}`);
     console.log(`  cwd: ${cwd}`);
@@ -211,20 +210,29 @@ function runClaudeResume(prompt, sessionId, cwd, timeoutSeconds) {
       if (code === 0) {
         try {
           const parsed = JSON.parse(stdout);
+          // Extract text from the response
+          let text = "";
+          if (parsed.result) {
+            text = parsed.result;
+          } else if (Array.isArray(parsed.content)) {
+            text = parsed.content
+              .filter((c) => c.type === "text")
+              .map((c) => c.text)
+              .join("\n");
+          } else {
+            text = stdout;
+          }
           resolve({
-            text:
-              parsed.result ||
-              (parsed.content || [])
-                .filter((c) => c.type === "text")
-                .map((c) => c.text)
-                .join("\n") ||
-              stdout,
-            sessionId: parsed.session_id || sessionId,
+            text: text || "(empty response)",
+            sessionId: parsed.session_id || null,
             raw: parsed,
           });
         } catch {
-          // Not JSON, return raw text
-          resolve({ text: stdout.trim() || "(empty response)", sessionId, raw: null });
+          resolve({
+            text: stdout.trim() || "(empty response)",
+            sessionId: null,
+            raw: null,
+          });
         }
       } else {
         reject(new Error(stderr || `Claude exited with code ${code}`));
@@ -259,6 +267,46 @@ function splitMessage(text, maxLength = 1900) {
   return chunks;
 }
 
+// ─── Parse session info from webhook embeds ──────────────
+function parseSessionFromEmbed(embed) {
+  if (!embed || !embed.fields) return null;
+
+  let sessionId = null;
+  let cwd = null;
+  let branch = null;
+  let project = null;
+
+  for (const field of embed.fields) {
+    const name = field.name || "";
+    const value = field.value || "";
+
+    if (name.includes("Session")) {
+      const match = value.match(/([a-f0-9-]{8,})/);
+      if (match) sessionId = match[1];
+    }
+    if (name.includes("Directory")) {
+      const match = value.match(/`([^`]+)`/);
+      if (match) cwd = match[1];
+    }
+    if (name.includes("Branch")) {
+      branch = value.replace(/`/g, "").trim();
+    }
+    if (name.includes("Project")) {
+      project = value.replace(/`/g, "").trim();
+    }
+    // Also try to extract full session ID from Resume command
+    if (name.includes("Resume")) {
+      const resumeMatch = value.match(/--resume\s+([a-f0-9-]+)/);
+      if (resumeMatch) sessionId = resumeMatch[1];
+      // Also grab cwd from the cd command
+      const cdMatch = value.match(/cd\s+([^\s&]+)/);
+      if (cdMatch && !cwd) cwd = cdMatch[1];
+    }
+  }
+
+  return sessionId && cwd ? { sessionId, cwd, branch, project } : null;
+}
+
 // ─── Discord Bot ─────────────────────────────────────────
 const client = new Client({
   intents: [
@@ -273,7 +321,6 @@ const sessions = new SessionTracker();
 const queue = new PromptQueue(CONFIG.maxQueueSize);
 const lock = new SecurityLock(CONFIG.passphrase, CONFIG.autoLockMinutes);
 
-// ─── Authorization ───────────────────────────────────────
 function isAuthorized(message) {
   if (message.author.bot) return false;
   if (message.author.id !== CONFIG.allowedUserId) return false;
@@ -299,109 +346,97 @@ async function cmdHelp(message) {
     .setColor(0x5865f2)
     .setTitle("🤖 Claude Code Remote — Help")
     .setDescription(
-      "This bot lets you continue Claude Code sessions from your phone via Discord.\n\n" +
+      "Continue Claude Code sessions from your phone via Discord.\n\n" +
         "**How it works:**\n" +
-        "Claude Code hooks send notifications here when tasks finish or need input. " +
-        "Your replies are sent back to Claude Code using `--resume`.\n"
+        "Hooks notify you here when Claude finishes. " +
+        "Your replies run `claude -c -p` (continue mode) in the project directory.\n",
     )
     .addFields(
       {
         name: "Commands",
         value: [
           "`!help` — This help message",
-          "`!status` — Current session, queue, and lock status",
+          "`!status` — Current session & queue status",
           "`!sessions` — List all tracked sessions",
-          "`!switch <id>` — Switch active session by ID prefix",
-          "`!clear` — Clear all tracked sessions",
+          "`!switch <id>` — Switch active session",
+          "`!clear` — Clear all sessions",
           "`!queue` — View pending jobs",
-          "`!cancel` — Clear the job queue",
-          "`!lock` — Lock the bot (requires passphrase to unlock)",
-          "`!unlock` — Unlock with passphrase",
+          "`!cancel` — Clear job queue",
+          "`!lock` / `!unlock` — Passphrase lock",
         ].join("\n"),
       },
       {
         name: "Usage",
         value:
-          "Just type any message to send it to the active Claude Code session. " +
-          "The bot will `--resume` the session with your input and return the response.",
-      }
+          "Just type a message to send it to the active session's project directory using `claude -c -p`.",
+      },
     );
   await message.reply({ embeds: [embed] });
 }
 
 async function cmdStatus(message) {
   const active = sessions.getActive();
-  const queueStatus = queue.getStatus();
-
-  const embed = new EmbedBuilder().setColor(0x5865f2).setTitle("📊 Status").addFields(
-    {
-      name: "Active Session",
-      value: active
-        ? `**${active.project}** (${active.branch})\n\`${active.id.substring(0, 12)}...\`\n📂 \`${active.cwd}\``
-        : "None — waiting for Claude Code hooks to report a session",
-      inline: false,
-    },
-    {
-      name: "Queue",
-      value: `${queueStatus.pending} pending | ${queueStatus.processing ? "⚙️ Processing" : "✅ Idle"}`,
-      inline: true,
-    },
-    {
-      name: "Security",
-      value: lock.isUnlocked() ? "🔓 Unlocked" : "🔒 Locked",
-      inline: true,
-    }
-  );
-
-  if (queueStatus.currentPrompt) {
-    embed.addFields({
-      name: "Current Job",
-      value: `\`${queueStatus.currentPrompt}...\``,
-      inline: false,
-    });
-  }
-
+  const qs = queue.getStatus();
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("📊 Status")
+    .addFields(
+      {
+        name: "Active Session",
+        value: active
+          ? `**${active.project}** (${active.branch})\nSession: \`${active.id.substring(0, 12)}...\`\nDir: \`${active.cwd}\``
+          : "None — start Claude Code with hooks, and it'll appear here",
+        inline: false,
+      },
+      {
+        name: "Queue",
+        value: `${qs.pending} pending | ${qs.processing ? "⚙️ Processing" : "✅ Idle"}`,
+        inline: true,
+      },
+      {
+        name: "Security",
+        value: lock.isUnlocked() ? "🔓 Unlocked" : "🔒 Locked",
+        inline: true,
+      },
+    );
   await message.reply({ embeds: [embed] });
 }
 
 async function cmdSessions(message) {
   const list = sessions.list();
   if (list.length === 0) {
-    await message.reply("No sessions tracked yet. Start Claude Code with hooks enabled to see sessions here.");
+    await message.reply(
+      "No sessions tracked yet. Use Claude Code with hooks enabled.",
+    );
     return;
   }
-
   const lines = list.map((s, i) => {
     const active = s.id === sessions.activeSession ? " ← active" : "";
     const age = Math.round((Date.now() - s.lastSeen) / 60000);
     return `**${i + 1}.** \`${s.id.substring(0, 12)}...\` — **${s.project}** (${s.branch}) — ${age}m ago${active}`;
   });
-
   const embed = new EmbedBuilder()
     .setColor(0x57f287)
     .setTitle("📋 Tracked Sessions")
     .setDescription(lines.join("\n"))
     .setFooter({ text: "Use !switch <id-prefix> to change active session" });
-
   await message.reply({ embeds: [embed] });
 }
 
 async function cmdSwitch(message) {
   const prefix = message.content.split(/\s+/)[1];
   if (!prefix) {
-    await message.reply("Usage: `!switch <session-id-prefix>`\nUse `!sessions` to see available sessions.");
+    await message.reply("Usage: `!switch <session-id-prefix>`");
     return;
   }
-
   const match = sessions.list().find((s) => s.id.startsWith(prefix));
   if (!match) {
-    await message.reply(`No session found starting with \`${prefix}\`. Use \`!sessions\` to list.`);
+    await message.reply(`No session found starting with \`${prefix}\`.`);
     return;
   }
-
   sessions.setActive(match.id);
   await message.reply(
-    `✅ Switched to **${match.project}** (${match.branch})\nSession: \`${match.id.substring(0, 12)}...\`\nDirectory: \`${match.cwd}\``
+    `✅ Switched to **${match.project}** (${match.branch})\nDir: \`${match.cwd}\``,
   );
 }
 
@@ -411,11 +446,11 @@ async function cmdClear(message) {
 }
 
 async function cmdQueue(message) {
-  const status = queue.getStatus();
+  const s = queue.getStatus();
   await message.reply(
-    status.processing
-      ? `⚙️ Processing: \`${status.currentPrompt}...\`\n📋 ${status.pending} job(s) queued`
-      : "✅ Queue is empty."
+    s.processing
+      ? `⚙️ Processing: \`${s.currentPrompt}...\`\n📋 ${s.pending} queued`
+      : "✅ Queue is empty.",
   );
 }
 
@@ -426,138 +461,89 @@ async function cmdCancel(message) {
 
 async function cmdLock(message) {
   if (!CONFIG.passphrase) {
-    await message.reply("No passphrase configured. Set `BOT_PASSPHRASE` in .env to enable locking.");
+    await message.reply(
+      "No passphrase configured. Set `BOT_PASSPHRASE` in .env.",
+    );
     return;
   }
   lock.lock();
-  await message.reply("🔒 Bot locked. Use `!unlock` with your passphrase to resume.");
+  await message.reply("🔒 Locked.");
 }
 
 async function cmdUnlock(message) {
   if (!CONFIG.passphrase) {
-    await message.reply("No passphrase configured — bot is always unlocked.");
+    await message.reply("No passphrase needed — bot is always unlocked.");
     return;
   }
   const phrase = message.content.replace(/^!unlock\s*/i, "").trim();
   if (lock.tryUnlock(phrase)) {
-    // Delete the message containing the passphrase for security
     try {
       await message.delete();
     } catch {}
-    await message.channel.send("🔓 Bot unlocked! You can now send prompts.");
+    await message.channel.send("🔓 Unlocked!");
   } else {
     await message.reply("❌ Wrong passphrase.");
   }
 }
 
-// ─── Webhook Listener (receives hook data) ───────────────
-// The hooks send data via Discord webhook (embeds).
-// The bot also needs to parse those webhook messages to track sessions.
-// We do this by watching for embed messages from webhooks in the channel.
-
-function parseSessionFromEmbed(embed) {
-  if (!embed || !embed.fields) return null;
-
-  let sessionId = null;
-  let cwd = null;
-  let branch = null;
-  let project = null;
-
-  for (const field of embed.fields) {
-    if (field.name.includes("Session")) {
-      // Extract session ID from backtick-wrapped text like `abc123def4...`
-      const match = field.value.match(/`([^`]+)`/);
-      if (match) sessionId = match[1].replace("...", "");
-    }
-    if (field.name.includes("Directory")) {
-      const match = field.value.match(/`([^`]+)`/);
-      if (match) cwd = match[1];
-    }
-    if (field.name.includes("Branch")) {
-      const match = field.value.match(/`([^`]+)`/);
-      if (match) branch = match[1];
-    }
-    if (field.name.includes("Project")) {
-      const match = field.value.match(/`([^`]+)`/);
-      if (match) project = match[1];
-    }
-  }
-
-  // Try to find full session ID from resume command field
-  for (const field of embed.fields) {
-    if (field.name.includes("Resume")) {
-      const match = field.value.match(/--resume\s+([a-f0-9-]+)/);
-      if (match) sessionId = match[1];
-    }
-  }
-
-  return sessionId && cwd ? { sessionId, cwd, branch, project } : null;
-}
-
 // ─── Main Message Handler ────────────────────────────────
 client.on(Events.MessageCreate, async (message) => {
-  // Track sessions from webhook embed messages
+  // Track sessions from webhook embed messages (sent by hooks)
   if (message.author.bot && message.embeds.length > 0) {
     for (const embed of message.embeds) {
-      const sessionInfo = parseSessionFromEmbed(embed);
-      if (sessionInfo) {
-        sessions.track(sessionInfo.sessionId, sessionInfo.cwd, {
-          branch: sessionInfo.branch || "unknown",
+      const info = parseSessionFromEmbed(embed);
+      if (info) {
+        sessions.track(info.sessionId, info.cwd, {
+          branch: info.branch || "unknown",
         });
-        console.log(`📍 Tracked session: ${sessionInfo.sessionId.substring(0, 12)}... → ${sessionInfo.cwd}`);
+        console.log(
+          `📍 Tracked: ${info.sessionId.substring(0, 12)}... → ${info.cwd}`,
+        );
       }
     }
     return;
   }
 
-  // Ignore other bots
   if (message.author.bot) return;
-
-  // Auth check
   if (!isAuthorized(message)) return;
 
   const content = message.content.trim();
   if (!content) return;
 
-  // Handle commands
+  // Commands
   const cmd = content.toLowerCase().split(/\s+/)[0];
   if (COMMANDS[cmd]) {
     await COMMANDS[cmd](message);
     return;
   }
 
-  // Handle unlock attempts
+  // Lock check
   if (!lock.isUnlocked()) {
     if (content.startsWith("!unlock")) {
       await cmdUnlock(message);
     } else {
-      await message.reply("🔒 Bot is locked. Use `!unlock <passphrase>` to unlock.");
+      await message.reply("🔒 Locked. Use `!unlock <passphrase>`.");
     }
     return;
   }
-
-  // Touch security timer
   lock.touch();
 
-  // It's a prompt — find active session
+  // Get active session
   const active = sessions.getActive();
   if (!active) {
     await message.reply(
-      "⚠️ No active session. Start Claude Code with hooks enabled, and the bot will auto-detect sessions when Claude finishes a task.\n\n" +
-        "Or send a fresh prompt without resume: the bot will start a new Claude Code session in your home directory."
+      "⚠️ No active session. Start Claude Code with hooks enabled — " +
+        "the bot will auto-detect sessions when Claude finishes a task.",
     );
     return;
   }
 
   const prompt = content;
-  const sessionId = active.id;
   const cwd = active.cwd;
 
-  // Enqueue the job
   const result = queue.enqueue({
     prompt,
     execute: async () => {
-      // Typing indicator
       await message.channel.sendTyping();
       const typingInterval = setInterval(() => {
         message.channel.sendTyping().catch(() => {});
@@ -566,41 +552,49 @@ client.on(Events.MessageCreate, async (message) => {
       try {
         await message.react("⏳");
 
-        const response = await runClaudeResume(prompt, sessionId, cwd, CONFIG.claudeTimeout);
+        const response = await runClaudeContinue(
+          prompt,
+          cwd,
+          CONFIG.claudeTimeout,
+        );
 
-        // Update session tracking
+        // Update session if we got a new session ID back
         if (response.sessionId) {
           sessions.track(response.sessionId, cwd, { branch: active.branch });
         }
 
-        await message.reactions.cache.get("⏳")?.remove().catch(() => {});
+        await message.reactions.cache
+          .get("⏳")
+          ?.remove()
+          .catch(() => {});
         await message.react("✅");
 
-        // Send response
         const chunks = splitMessage(response.text);
         for (let i = 0; i < chunks.length; i++) {
-          const msg = chunks.length > 1 ? `${chunks[i]}\n\n_[${i + 1}/${chunks.length}]_` : chunks[i];
+          const msg =
+            chunks.length > 1
+              ? `${chunks[i]}\n\n_[${i + 1}/${chunks.length}]_`
+              : chunks[i];
           if (i === 0) {
             await message.reply(msg);
           } else {
             await message.channel.send(msg);
           }
         }
-
-        // Queue status
-        const qs = queue.getStatus();
-        if (qs.pending > 0) {
-          await message.channel.send(`📋 _${qs.pending} job(s) remaining..._`);
-        }
       } catch (error) {
-        await message.reactions.cache.get("⏳")?.remove().catch(() => {});
+        await message.reactions.cache
+          .get("⏳")
+          ?.remove()
+          .catch(() => {});
         await message.react("❌");
 
         const errEmbed = new EmbedBuilder()
           .setColor(0xed4245)
           .setTitle("❌ Error")
           .setDescription(`\`\`\`${error.message.substring(0, 1000)}\`\`\``)
-          .setFooter({ text: "Check that Claude Code is installed and the session directory exists" });
+          .setFooter({
+            text: "Check Claude Code is installed and project directory exists",
+          });
         await message.reply({ embeds: [errEmbed] });
       } finally {
         clearInterval(typingInterval);
@@ -613,9 +607,9 @@ client.on(Events.MessageCreate, async (message) => {
   });
 
   if (result.success && result.position > 1) {
-    await message.reply(`📋 Queued at position **${result.position}**. ${result.position - 1} ahead.`);
+    await message.reply(`📋 Queued at position **${result.position}**.`);
   } else if (!result.success) {
-    await message.reply("⚠️ Queue is full. Wait for current jobs to finish.");
+    await message.reply("⚠️ Queue full. Wait for current jobs to finish.");
   }
 });
 
@@ -626,26 +620,25 @@ client.once(Events.ClientReady, () => {
   console.log("╠═══════════════════════════════════════════════╣");
   console.log(`║  Bot       : ${client.user.tag.padEnd(32)}║`);
   console.log(`║  User      : ${CONFIG.allowedUserId.padEnd(32)}║`);
-  console.log(`║  Channel   : ${(CONFIG.channelId || "Any / DMs").padEnd(32)}║`);
-  console.log(`║  Passphrase: ${(CONFIG.passphrase ? "Enabled" : "Disabled").padEnd(32)}║`);
-  console.log(`║  Auto-lock : ${(CONFIG.autoLockMinutes ? CONFIG.autoLockMinutes + " min" : "Disabled").padEnd(32)}║`);
-  console.log(`║  Queue     : ${(CONFIG.maxQueueSize + " max").padEnd(32)}║`);
+  console.log(
+    `║  Channel   : ${(CONFIG.channelId || "Any / DMs").padEnd(32)}║`,
+  );
+  console.log(
+    `║  Passphrase: ${(CONFIG.passphrase ? "Enabled" : "Disabled").padEnd(32)}║`,
+  );
+  console.log(`║  Mode      : ${"claude -c -p (continue)".padEnd(32)}║`);
   console.log("╠═══════════════════════════════════════════════╣");
-  console.log("║  Waiting for Claude Code hooks to report...   ║");
+  console.log("║  Waiting for hooks to report sessions...      ║");
   console.log("╚═══════════════════════════════════════════════╝");
 });
 
-// ─── Graceful Shutdown ───────────────────────────────────
 process.on("SIGINT", () => {
-  console.log("\n🛑 Shutting down...");
   client.destroy();
   process.exit(0);
 });
 process.on("SIGTERM", () => {
-  console.log("\n🛑 Shutting down...");
   client.destroy();
   process.exit(0);
 });
 
-// ─── Start ───────────────────────────────────────────────
 client.login(CONFIG.token);

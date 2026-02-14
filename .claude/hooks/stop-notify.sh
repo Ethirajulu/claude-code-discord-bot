@@ -1,85 +1,99 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────
 # Claude Code Stop Hook → Discord Notification
-# 
 # Fires when Claude Code finishes responding.
-# Sends the session info to your Discord webhook so you
-# can continue the conversation from your phone.
-#
-# Install: Copy to .claude/hooks/ in your project or ~/.claude/hooks/ globally
-# Config:  Set DISCORD_WEBHOOK_URL environment variable
+# Works on both macOS and Linux.
 # ─────────────────────────────────────────────────────────
 
-# Exit silently if no webhook configured
-if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+INPUT=$(cat)
+
+# Guard: prevent infinite loops
+STOP_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false')
+if [ "$STOP_ACTIVE" = "true" ]; then
   exit 0
 fi
 
-# Read JSON input from stdin (Claude Code sends hook context here)
-INPUT=$(cat)
+WEBHOOK_URL="${DISCORD_WEBHOOK_URL}"
+[ -z "$WEBHOOK_URL" ] && exit 0
 
-# Parse fields from the hook input
+# Parse hook input
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // "unknown"')
 CWD=$(echo "$INPUT" | jq -r '.cwd // "unknown"')
-HOOK_EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // "Stop"')
-STOP_HOOK_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false')
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // ""')
 
-# Get project name from directory
 PROJECT_NAME=$(basename "$CWD")
-
-# Get git branch if available
 GIT_BRANCH=$(cd "$CWD" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "N/A")
-
-# Get timestamp
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
-# Try to extract last assistant message from transcript for context
-LAST_MESSAGE=""
-if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
-  # Get the last assistant message (truncated to 500 chars for Discord)
-  LAST_MESSAGE=$(tail -20 "$TRANSCRIPT_PATH" | \
-    jq -r 'select(.type == "assistant") | .message.content[] | select(.type == "text") | .text' 2>/dev/null | \
-    tail -1 | \
-    head -c 500)
-  
-  if [[ ${#LAST_MESSAGE} -ge 500 ]]; then
-    LAST_MESSAGE="${LAST_MESSAGE}..."
+# ─── Reverse file reader (works on macOS and Linux) ───
+reverse_file() {
+  if command -v tac > /dev/null 2>&1; then
+    tac "$1"
+  else
+    tail -r "$1"
   fi
-fi
-
-# Build Discord embed payload
-if [[ -n "$LAST_MESSAGE" ]]; then
-  DESCRIPTION="**Last response preview:**\n\`\`\`\n$(echo "$LAST_MESSAGE" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')\n\`\`\`"
-else
-  DESCRIPTION="Claude has finished responding."
-fi
-
-# Escape for JSON
-DESCRIPTION_ESCAPED=$(echo "$DESCRIPTION" | sed 's/\\/\\\\/g')
-
-PAYLOAD=$(cat <<EOF
-{
-  "embeds": [{
-    "title": "✅ Claude Code Finished",
-    "description": "$DESCRIPTION_ESCAPED",
-    "color": 5763719,
-    "fields": [
-      { "name": "📁 Project", "value": "\`$PROJECT_NAME\`", "inline": true },
-      { "name": "🌿 Branch", "value": "\`$GIT_BRANCH\`", "inline": true },
-      { "name": "🔑 Session", "value": "\`${SESSION_ID:0:12}...\`", "inline": true },
-      { "name": "📂 Directory", "value": "\`$CWD\`", "inline": false },
-      { "name": "💬 Resume Command", "value": "Reply in Discord to continue, or run:\n\`\`\`\ncd '$CWD' && claude --resume $SESSION_ID\n\`\`\`", "inline": false }
-    ],
-    "footer": { "text": "$TIMESTAMP" }
-  }]
 }
-EOF
-)
 
-# Send to Discord webhook
-curl -s -o /dev/null -X POST "$DISCORD_WEBHOOK_URL" \
-  -H "Content-Type: application/json" \
-  -d "$PAYLOAD"
+# ─── Extract last meaningful assistant text from JSONL transcript ───
+LAST_MSG=""
+if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+  # Read transcript in reverse, find last assistant message with real text content.
+  # Skip trivial messages like "No response requested." to find the actual response.
+  LAST_MSG=$(reverse_file "$TRANSCRIPT_PATH" | while IFS= read -r line; do
+    line_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
+    if [ "$line_type" = "assistant" ]; then
+      text=$(echo "$line" | jq -r '[.message.content[]? | select(.type == "text") | .text] | join("\n")' 2>/dev/null)
+      # Skip trivial/empty responses
+      if [ -n "$text" ] && [ "$text" != "No response requested." ] && [ "$text" != "null" ]; then
+        echo "$text"
+        break
+      fi
+    fi
+  done)
+
+  # If all assistant messages were trivial, just grab the last one anyway
+  if [ -z "$LAST_MSG" ]; then
+    LAST_MSG=$(reverse_file "$TRANSCRIPT_PATH" | while IFS= read -r line; do
+      line_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
+      if [ "$line_type" = "assistant" ]; then
+        echo "$line" | jq -r '[.message.content[]? | select(.type == "text") | .text] | join("\n")' 2>/dev/null
+        break
+      fi
+    done)
+  fi
+
+  # Truncate
+  LAST_MSG=$(echo "$LAST_MSG" | head -c 500)
+fi
+
+[ -z "$LAST_MSG" ] && LAST_MSG="Claude finished. Check terminal for details."
+
+# ─── Build payload with jq ───
+PAYLOAD=$(jq -n \
+  --arg preview "$LAST_MSG" \
+  --arg project "$PROJECT_NAME" \
+  --arg branch "$GIT_BRANCH" \
+  --arg session_short "${SESSION_ID:0:12}..." \
+  --arg cwd "$CWD" \
+  --arg session_full "$SESSION_ID" \
+  --arg timestamp "$TIMESTAMP" \
+  '{
+    username: "Claude Code",
+    embeds: [{
+      title: "✅ Claude Code Finished",
+      description: ("```\n" + ($preview | .[0:500]) + "\n```"),
+      color: 5763719,
+      fields: [
+        { name: "📁 Project", value: $project, inline: true },
+        { name: "🌿 Branch", value: $branch, inline: true },
+        { name: "🔑 Session", value: $session_short, inline: true },
+        { name: "📂 Directory", value: ("`" + $cwd + "`"), inline: false },
+        { name: "💬 Resume", value: ("Reply here to continue, or:\n```\ncd " + $cwd + " && claude --continue\n```"), inline: false }
+      ],
+      footer: { text: $timestamp }
+    }]
+  }')
+
+curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK_URL" > /dev/null 2>&1 &
 
 exit 0
