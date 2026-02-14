@@ -180,43 +180,54 @@ class SecurityLock {
 // ─── Claude Code Runner ──────────────────────────────────
 // Uses --continue instead of --resume because -p --resume has a confirmed bug
 // (GitHub #1967). --continue picks up the most recent session in the given cwd.
+// Pipes prompt via stdin to avoid shell quoting issues with special characters.
 function runClaudeContinue(prompt, cwd, timeoutSeconds) {
   return new Promise((resolve, reject) => {
-    // -c = --continue (most recent session in this directory)
-    // -p = print/headless mode (non-interactive)
-    const args = [
-      "-c",
-      "-p",
-      `"${prompt}"`,
-      "--output-format",
-      "json",
-      "--dangerously-skip-permissions",
-    ];
+    const cmd = `claude -c -p --output-format json --dangerously-skip-permissions`;
 
-    console.log(`▶ Running: claude ${args.join(" ")}`);
+    console.log(`▶ Running: ${cmd}`);
     console.log(`  cwd: ${cwd}`);
+    console.log(`  prompt: ${prompt.substring(0, 80)}...`);
 
-    const child = spawn("claude", args, {
+    const child = spawn("bash", ["-lc", cmd], {
       cwd: cwd,
-      env: { ...process.env },
-      timeout: timeoutSeconds * 1000,
+      env: { ...process.env, HOME: process.env.HOME },
+      stdio: ["pipe", "pipe", "pipe"],
     });
+
+    // Write prompt to stdin and close it
+    child.stdin.write(prompt);
+    child.stdin.end();
 
     let stdout = "";
     let stderr = "";
 
     child.stdout.on("data", (data) => {
-      stdout += data.toString();
+      const chunk = data.toString();
+      stdout += chunk;
+      // Progress indicator
+      if (stdout.length % 5000 < 100) {
+        console.log(`  ...receiving data (${stdout.length} bytes so far)`);
+      }
     });
 
     child.stderr.on("data", (data) => {
       stderr += data.toString();
     });
 
-    child.on("close", (code) => {
-      console.log(`◀ Claude exited with code: ${code}`);
+    // Manual timeout since spawn doesn't support timeout option
+    const timer = setTimeout(() => {
+      console.log(`⏰ Timeout after ${timeoutSeconds}s — killing process`);
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 5000);
+      reject(new Error(`Claude timed out after ${timeoutSeconds} seconds`));
+    }, timeoutSeconds * 1000);
+
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      console.log(`◀ Claude exited — code: ${code}, signal: ${signal}`);
       console.log(`  stdout length: ${stdout.length}`);
-      console.log(`  stderr: ${stderr.substring(0, 200) || "(empty)"}`);
+      if (stderr) console.log(`  stderr: ${stderr.substring(0, 300)}`);
 
       if (code === 0) {
         try {
@@ -232,15 +243,15 @@ function runClaudeContinue(prompt, cwd, timeoutSeconds) {
           } else {
             text = stdout;
           }
-          console.log(`  parsed result length: ${text.length}`);
+          console.log(`  ✅ parsed result length: ${text.length}`);
           resolve({
             text: text || "(empty response)",
             sessionId: parsed.session_id || null,
             raw: parsed,
           });
         } catch (parseErr) {
-          console.log(`  JSON parse error: ${parseErr.message}`);
-          console.log(`  raw stdout (first 200): ${stdout.substring(0, 200)}`);
+          console.log(`  ⚠️ JSON parse error: ${parseErr.message}`);
+          console.log(`  raw stdout (first 300): ${stdout.substring(0, 300)}`);
           resolve({
             text: stdout.trim() || "(empty response)",
             sessionId: null,
@@ -248,13 +259,18 @@ function runClaudeContinue(prompt, cwd, timeoutSeconds) {
           });
         }
       } else {
-        console.log(`  FAILED stderr: ${stderr}`);
-        reject(new Error(stderr || `Claude exited with code ${code}`));
+        console.log(`  ❌ FAILED — stderr: ${stderr}`);
+        reject(
+          new Error(
+            stderr || `Claude exited with code ${code} (signal: ${signal})`,
+          ),
+        );
       }
     });
 
     child.on("error", (err) => {
-      console.log(`  spawn error: ${err.message}`);
+      clearTimeout(timer);
+      console.log(`  ❌ spawn error: ${err.message}`);
       reject(new Error(`Failed to run Claude Code: ${err.message}`));
     });
   });
