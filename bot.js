@@ -184,7 +184,14 @@ function runClaudeContinue(prompt, cwd, timeoutSeconds) {
   return new Promise((resolve, reject) => {
     // -c = --continue (most recent session in this directory)
     // -p = print/headless mode (non-interactive)
-    const args = ["-c", "-p", prompt, "--output-format", "json"];
+    const args = [
+      "-c",
+      "-p",
+      `"${prompt}"`,
+      "--output-format",
+      "json",
+      "--dangerously-skip-permissions",
+    ];
 
     console.log(`▶ Running: claude ${args.join(" ")}`);
     console.log(`  cwd: ${cwd}`);
@@ -207,10 +214,13 @@ function runClaudeContinue(prompt, cwd, timeoutSeconds) {
     });
 
     child.on("close", (code) => {
+      console.log(`◀ Claude exited with code: ${code}`);
+      console.log(`  stdout length: ${stdout.length}`);
+      console.log(`  stderr: ${stderr.substring(0, 200) || "(empty)"}`);
+
       if (code === 0) {
         try {
           const parsed = JSON.parse(stdout);
-          // Extract text from the response
           let text = "";
           if (parsed.result) {
             text = parsed.result;
@@ -222,12 +232,15 @@ function runClaudeContinue(prompt, cwd, timeoutSeconds) {
           } else {
             text = stdout;
           }
+          console.log(`  parsed result length: ${text.length}`);
           resolve({
             text: text || "(empty response)",
             sessionId: parsed.session_id || null,
             raw: parsed,
           });
-        } catch {
+        } catch (parseErr) {
+          console.log(`  JSON parse error: ${parseErr.message}`);
+          console.log(`  raw stdout (first 200): ${stdout.substring(0, 200)}`);
           resolve({
             text: stdout.trim() || "(empty response)",
             sessionId: null,
@@ -235,11 +248,13 @@ function runClaudeContinue(prompt, cwd, timeoutSeconds) {
           });
         }
       } else {
+        console.log(`  FAILED stderr: ${stderr}`);
         reject(new Error(stderr || `Claude exited with code ${code}`));
       }
     });
 
     child.on("error", (err) => {
+      console.log(`  spawn error: ${err.message}`);
       reject(new Error(`Failed to run Claude Code: ${err.message}`));
     });
   });
@@ -557,6 +572,9 @@ client.on(Events.MessageCreate, async (message) => {
           cwd,
           CONFIG.claudeTimeout,
         );
+        console.log(
+          `✅ Got response, text length: ${response.text.length}, sessionId: ${response.sessionId}`,
+        );
 
         // Update session if we got a new session ID back
         if (response.sessionId) {
@@ -582,6 +600,7 @@ client.on(Events.MessageCreate, async (message) => {
           }
         }
       } catch (error) {
+        console.log(`❌ Error in execute: ${error.message}`);
         await message.reactions.cache
           .get("⏳")
           ?.remove()
