@@ -16,7 +16,7 @@ Continue your Claude Code terminal sessions from your phone via Discord. Built o
 
 1. **You work in Claude Code normally** in your terminal
 2. **When Claude finishes** → Stop hook sends the result to Discord
-3. **When Claude wants to use a tool** (Edit, Write, Bash, etc.) → PreToolUse hook sends permission request to Discord
+3. **When Claude wants to run a command or create a file** (Bash/Write) → PreToolUse hook sends permission request to Discord
 4. **You click Allow/Deny/Allow All/Modify** → Bot approves/denies in Claude Code
 5. **You reply in Discord** → Bot runs `claude -c -p "your reply"` (continue mode) in the same project directory
 6. **Response comes back** to Discord
@@ -136,7 +136,7 @@ Discord:   I've created test files for the JWT validation...
 
 ### Permission Approval
 
-When Claude wants to use a restricted tool (Edit, Write, Bash, etc.), the bot sends a permission request to Discord:
+When Claude wants to use Bash or Write (the only gated tools), the bot sends a permission request to Discord:
 
 - **Allow** — Approve this one use
 - **Deny** — Block this use
@@ -177,10 +177,10 @@ claude-discord-bot/
           ├── notification-notify.sh
           └── permission-bridge.sh
 
-Permission Flow:
-  Claude wants to Edit file
+Permission Flow (Bash/Write only):
+  Claude wants to run a command or create a file
     ↓
-  PreToolUse hook fires
+  PreToolUse hook fires (matcher: "Bash" or "Write")
     ↓
   permission-bridge.sh POSTs to localhost:3847
     ↓
@@ -191,6 +191,8 @@ Permission Flow:
   Bot responds to hook script
     ↓
   Claude Code proceeds/blocks
+
+  Other tools (Edit, Read, Task, etc.) run freely via --allowedTools
 ```
 
 ## Security
@@ -203,7 +205,7 @@ Permission Flow:
 - **Permission approval** — you control which tools Claude can use via Discord buttons
 - **Tool modification** — use the "Modify" button to edit commands before approval (e.g., change `rm -rf` to `rm`)
 - **Passphrase auto-deletion** — unlock messages are deleted to keep the passphrase out of chat history
-- **Base tools auto-allowed** — safe tools (Read, Grep, Glob, WebSearch) bypass permission buttons
+- **Only Bash/Write gated** — hook matchers only fire for Bash and Write; all other tools run freely via `--allowedTools`
 
 ## Cost
 
@@ -221,7 +223,7 @@ Permission Flow:
 | "No active session" | Claude Code hasn't fired a hook yet — run something in Claude Code first |
 | Permission times out (no button click) | Button waits 10 minutes; click to approve or deny, or restart bot to reset |
 | "No permission to edit" message shows up | Bot isn't running on port 3847, or `PERMISSION_PORT` env var isn't exported. Restart bot and check `echo $PERMISSION_PORT` |
-| Claude can't use Edit/Write tools | You need to click "Allow" or "Allow All" on the permission button in Discord |
+| Claude can't run Bash/Write | You need to click "Allow" or "Allow All" on the permission button in Discord |
 | Hooks not firing | Run `claude --debug` to check hook execution, or type `/hooks` inside Claude Code |
 
 ## Requirements

@@ -36,7 +36,7 @@ No test suite exists. Manual testing requires a running bot + Claude Code sessio
 
 **Prompt flow:** Discord message → `PromptQueue` → `runClaudeContinue()` → `spawn("bash", ["-lc", "claude -c -p ..."])` with prompt piped via stdin → JSON response parsed → reply in Discord.
 
-**Permission flow:** Claude Code fires PreToolUse hook → `permission-bridge.sh` POSTs to `localhost:$PERMISSION_PORT` → bot checks auto-allow rules → if not auto-allowed, sends Discord embed with Allow/Deny/Allow All/Modify buttons → user clicks → HTTP response returned to hook → Claude proceeds or blocks.
+**Permission flow:** Claude Code fires PreToolUse hook (Bash/Write only) → `permission-bridge.sh` POSTs to `localhost:$PERMISSION_PORT` → bot sends Discord embed with Allow/Deny/Allow All/Modify buttons → user clicks → HTTP response returned to hook → Claude proceeds or blocks. All other tools (Edit, Read, Task, etc.) run freely via `--allowedTools`.
 
 **Session tracking:** Hook scripts post webhook embeds to Discord → bot's `MessageCreate` handler parses embed fields → `SessionTracker.track()` stores sessionId + cwd + branch.
 
@@ -67,7 +67,7 @@ No test suite exists. Manual testing requires a running bot + Claude Code sessio
 - **`--continue` not `--resume`**: `-p --resume` has a bug (GitHub #1967). `--continue` picks up the most recent session in the cwd.
 - **Stdin piping**: Prompt is written to `child.stdin` rather than passed as a CLI arg to avoid shell quoting issues.
 - **localhost-only HTTP**: Permission server binds to `127.0.0.1` — hooks and bot must be on the same machine.
-- **Base tools auto-allowed**: Read, Grep, Glob, LS, WebSearch bypass Discord buttons (defined in `BASE_ALLOWED_TOOLS`).
+- **Only Bash/Write gated**: Hook matchers only fire for Bash and Write. All other tools (Read, Grep, Glob, Edit, Task, etc.) run freely via `--allowedTools` — no Discord buttons needed.
 - **No persistent state**: Sessions are in-memory only; lost on bot restart. Hooks re-report on next Claude activity.
 
 ## Hook Installation
