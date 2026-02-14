@@ -191,7 +191,8 @@ const PERMISSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 // Wrap a decision in the hookSpecificOutput format Claude Code expects.
 // PreToolUse uses permissionDecision (not decision.behavior like PermissionRequest).
-const BASE_ALLOWED_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "WebSearch"]);
+// No longer needed — hook matchers now only fire for Bash/Write, so only those
+// tools reach the HTTP server.  Everything else runs freely via --allowedTools.
 
 function wrapPermissionResponse(decision) {
   const output = {
@@ -299,7 +300,10 @@ class PermissionManager {
 // Pipes prompt via stdin to avoid shell quoting issues with special characters.
 function runClaudeContinue(prompt, cwd, timeoutSeconds, sessionId) {
   return new Promise((resolve, reject) => {
-    const baseTools = ["Read", "Grep", "Glob", "LS", "WebSearch"];
+    const baseTools = [
+      "Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch",
+      "Edit", "Task", "NotebookEdit",
+    ];
     const sessionTools = sessionId
       ? permissions.getAllowedTools(sessionId)
       : [];
@@ -584,13 +588,6 @@ function startPermissionServer() {
 
       const sessionId = hookData.session_id || "unknown";
       const toolName = hookData.tool_name || "";
-
-      // Auto-allow base safe tools (Read, Grep, etc.) — no buttons needed
-      if (BASE_ALLOWED_TOOLS.has(toolName)) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(wrapPermissionResponse({ behavior: "allow" })));
-        return;
-      }
 
       // Auto-allow if "Allow All" was previously used for this tool
       if (permissions.isToolAllowed(sessionId, toolName)) {
