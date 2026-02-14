@@ -23,6 +23,18 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/permission-bridge.sh",
+            "timeout": 600
+          }
+        ]
+      }
     ]
   }
 }

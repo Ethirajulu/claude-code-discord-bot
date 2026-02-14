@@ -6,6 +6,11 @@
 
 INPUT=$(cat)
 
+# Skip permission-related notifications (handled by PermissionRequest hook)
+if echo "$INPUT" | grep -qi "permission"; then
+  exit 0
+fi
+
 WEBHOOK_URL="${DISCORD_WEBHOOK_URL}"
 [ -z "$WEBHOOK_URL" ] && exit 0
 

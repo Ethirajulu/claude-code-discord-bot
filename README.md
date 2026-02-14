@@ -16,11 +16,12 @@ Continue your Claude Code terminal sessions from your phone via Discord. Built o
 
 1. **You work in Claude Code normally** in your terminal
 2. **When Claude finishes** → Stop hook sends the result to Discord
-3. **When Claude needs input** → Notification hook pings you on Discord
-4. **You reply in Discord** → Bot runs `claude -p "your reply" --resume <session_id>` in the same project directory
-5. **Response comes back** to Discord
+3. **When Claude wants to use a tool** (Edit, Write, Bash, etc.) → PreToolUse hook sends permission request to Discord
+4. **You click Allow/Deny/Allow All/Modify** → Bot approves/denies in Claude Code
+5. **You reply in Discord** → Bot runs `claude -c -p "your reply"` (continue mode) in the same project directory
+6. **Response comes back** to Discord
 
-No raw terminal access. Claude Code's safety guardrails stay intact.
+No raw terminal access. Claude Code's safety guardrails stay intact — including a permission approval system that lets you control tool access remotely.
 
 ## Setup (10 minutes)
 
@@ -73,6 +74,7 @@ chmod +x install-hooks.sh
 # Add env vars to your shell
 echo 'export DISCORD_WEBHOOK_URL="your_webhook_url"' >> ~/.zshrc
 echo 'export ALLOWED_USER_ID="your_discord_user_id"' >> ~/.zshrc
+echo 'export PERMISSION_PORT="3847"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -125,11 +127,23 @@ Discord:   I've created test files for the JWT validation...
 | `!status` | Active session, queue, and lock status |
 | `!sessions` | List all tracked sessions |
 | `!switch <id>` | Switch to a different session |
-| `!clear` | Clear all tracked sessions |
+| `!clear` | Clear all sessions and permission overrides |
 | `!queue` | View pending jobs |
 | `!cancel` | Clear the queue |
 | `!lock` | Lock the bot |
 | `!unlock <phrase>` | Unlock with passphrase |
+| `!permissions` | View tools allowed for current session |
+
+### Permission Approval
+
+When Claude wants to use a restricted tool (Edit, Write, Bash, etc.), the bot sends a permission request to Discord:
+
+- **Allow** — Approve this one use
+- **Deny** — Block this use
+- **Allow All** — Auto-approve all future uses of this tool in this session
+- **Modify** — Edit the tool input (e.g., change a command) then approve
+
+The bot shows the tool name and input preview, so you can review before approving.
 
 ### Multiple Sessions
 
@@ -150,16 +164,33 @@ If you're working on multiple projects, hooks report all of them. Use `!sessions
 ~/.claude/settings.json          Your Claude Code hooks config
 ~/.claude/hooks/
   ├── stop-notify.sh             Fires on Stop → posts to Discord webhook
-  └── notification-notify.sh     Fires on Notification → pings you
+  ├── notification-notify.sh     Fires on Notification → pings you
+  └── permission-bridge.sh       Fires on PreToolUse → requests Discord approval
 
 claude-discord-bot/
-  ├── bot.js                     Discord bot that receives replies
+  ├── bot.js                     Discord bot: runs prompts, approves permissions
   ├── .env                       Your configuration
   └── .claude/
       ├── settings.json          Project-level hook config (alternative)
       └── hooks/
           ├── stop-notify.sh
-          └── notification-notify.sh
+          ├── notification-notify.sh
+          └── permission-bridge.sh
+
+Permission Flow:
+  Claude wants to Edit file
+    ↓
+  PreToolUse hook fires
+    ↓
+  permission-bridge.sh POSTs to localhost:3847
+    ↓
+  Bot sends Discord embed with buttons
+    ↓
+  You click Allow/Deny/Allow All/Modify
+    ↓
+  Bot responds to hook script
+    ↓
+  Claude Code proceeds/blocks
 ```
 
 ## Security
@@ -167,9 +198,12 @@ claude-discord-bot/
 - **Private bot** — only you can invite it, only your user ID can use it
 - **Passphrase lock** — optional passphrase required before bot accepts prompts
 - **Auto-lock** — locks after configurable minutes of inactivity
-- **No terminal exposure** — bot only calls `claude -p --resume`, not raw shell
-- **Claude Code guardrails** — all safety checks remain active
+- **No terminal exposure** — bot only calls `claude -c -p`, not raw shell
+- **Claude Code guardrails** — all safety checks remain active, including the permission approval system
+- **Permission approval** — you control which tools Claude can use via Discord buttons
+- **Tool modification** — use the "Modify" button to edit commands before approval (e.g., change `rm -rf` to `rm`)
 - **Passphrase auto-deletion** — unlock messages are deleted to keep the passphrase out of chat history
+- **Base tools auto-allowed** — safe tools (Read, Grep, Glob, WebSearch) bypass permission buttons
 
 ## Cost
 
@@ -182,10 +216,12 @@ claude-discord-bot/
 | Issue | Fix |
 |---|---|
 | No notifications in Discord | Check `DISCORD_WEBHOOK_URL` env var is set in your shell |
+| No permission buttons appear | Ensure `NOTIFICATION_CHANNEL_ID` is set in .env; bot needs a channel to post buttons |
 | Bot doesn't respond | Verify `ALLOWED_USER_ID` and `DISCORD_BOT_TOKEN` in .env |
 | "No active session" | Claude Code hasn't fired a hook yet — run something in Claude Code first |
-| Resume fails | Ensure the project directory still exists and Claude Code is installed |
-| Permission errors on resume | Add `--dangerously-skip-permissions` or configure allowed tools in `.claude/settings.json` |
+| Permission times out (no button click) | Button waits 10 minutes; click to approve or deny, or restart bot to reset |
+| "No permission to edit" message shows up | Bot isn't running on port 3847, or `PERMISSION_PORT` env var isn't exported. Restart bot and check `echo $PERMISSION_PORT` |
+| Claude can't use Edit/Write tools | You need to click "Allow" or "Allow All" on the permission button in Discord |
 | Hooks not firing | Run `claude --debug` to check hook execution, or type `/hooks` inside Claude Code |
 
 ## Requirements

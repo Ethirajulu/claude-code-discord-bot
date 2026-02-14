@@ -3,8 +3,16 @@ const {
   GatewayIntentBits,
   EmbedBuilder,
   Events,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ComponentType,
 } = require("discord.js");
 const { spawn } = require("child_process");
+const http = require("http");
 const path = require("path");
 require("dotenv").config();
 
@@ -17,6 +25,7 @@ const CONFIG = {
   autoLockMinutes: parseInt(process.env.AUTO_LOCK_MINUTES) || 15,
   maxQueueSize: parseInt(process.env.MAX_QUEUE_SIZE) || 5,
   claudeTimeout: parseInt(process.env.CLAUDE_TIMEOUT_SECONDS) || 300,
+  permissionPort: parseInt(process.env.PERMISSION_PORT) || 3847,
 };
 
 if (!CONFIG.token || CONFIG.token === "your_bot_token_here") {
@@ -177,13 +186,126 @@ class SecurityLock {
   }
 }
 
+// ─── Permission Manager ─────────────────────────────────
+const PERMISSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+// Wrap a decision in the hookSpecificOutput format Claude Code expects.
+// PreToolUse uses permissionDecision (not decision.behavior like PermissionRequest).
+const BASE_ALLOWED_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "WebSearch"]);
+
+function wrapPermissionResponse(decision) {
+  const output = {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: decision.behavior || "deny",
+    },
+  };
+  if (decision.updatedInput) {
+    output.hookSpecificOutput.updatedInput = decision.updatedInput;
+  }
+  if (decision.message) {
+    output.hookSpecificOutput.permissionDecisionReason = decision.message;
+  }
+  return output;
+}
+
+class PermissionManager {
+  constructor() {
+    this.pendingRequests = new Map();
+    this.sessionAllowedTools = new Map();
+  }
+
+  createRequest(requestId, httpRes, hookData) {
+    const timer = setTimeout(
+      () => this.timeoutRequest(requestId),
+      PERMISSION_TIMEOUT_MS,
+    );
+    this.pendingRequests.set(requestId, {
+      httpRes,
+      hookData,
+      timer,
+      discordMessage: null,
+      createdAt: Date.now(),
+    });
+    return requestId;
+  }
+
+  resolveRequest(requestId, decision) {
+    const req = this.pendingRequests.get(requestId);
+    if (!req) return false;
+    clearTimeout(req.timer);
+    try {
+      const wrapped = wrapPermissionResponse(decision);
+      req.httpRes.writeHead(200, { "Content-Type": "application/json" });
+      req.httpRes.end(JSON.stringify(wrapped));
+    } catch (err) {
+      console.error(`Failed to respond to permission request: ${err.message}`);
+    }
+    this.pendingRequests.delete(requestId);
+    return true;
+  }
+
+  async timeoutRequest(requestId) {
+    const req = this.pendingRequests.get(requestId);
+    if (!req) return;
+    this.resolveRequest(requestId, { behavior: "deny" });
+    if (req.discordMessage) {
+      try {
+        const embed = EmbedBuilder.from(req.discordMessage.embeds[0])
+          .setColor(0x95a5a6)
+          .setTitle("⏰ Permission Request — Timed Out");
+        await req.discordMessage.edit({
+          embeds: [embed],
+          components: [],
+        });
+      } catch {}
+    }
+  }
+
+  isToolAllowed(sessionId, toolName) {
+    const allowed = this.sessionAllowedTools.get(sessionId);
+    return allowed ? allowed.has(toolName) : false;
+  }
+
+  allowTool(sessionId, toolName) {
+    if (!this.sessionAllowedTools.has(sessionId)) {
+      this.sessionAllowedTools.set(sessionId, new Set());
+    }
+    this.sessionAllowedTools.get(sessionId).add(toolName);
+  }
+
+  getAllowedTools(sessionId) {
+    const allowed = this.sessionAllowedTools.get(sessionId);
+    return allowed ? Array.from(allowed) : [];
+  }
+
+  clearSession(sessionId) {
+    this.sessionAllowedTools.delete(sessionId);
+  }
+
+  getPending(requestId) {
+    return this.pendingRequests.get(requestId);
+  }
+
+  setDiscordMessage(requestId, message) {
+    const req = this.pendingRequests.get(requestId);
+    if (req) req.discordMessage = message;
+  }
+}
+
 // ─── Claude Code Runner ──────────────────────────────────
 // Uses --continue instead of --resume because -p --resume has a confirmed bug
 // (GitHub #1967). --continue picks up the most recent session in the given cwd.
 // Pipes prompt via stdin to avoid shell quoting issues with special characters.
-function runClaudeContinue(prompt, cwd, timeoutSeconds) {
+function runClaudeContinue(prompt, cwd, timeoutSeconds, sessionId) {
   return new Promise((resolve, reject) => {
-    const cmd = `claude -c -p --output-format json --dangerously-skip-permissions`;
+    const baseTools = ["Read", "Grep", "Glob", "LS", "WebSearch"];
+    const sessionTools = sessionId
+      ? permissions.getAllowedTools(sessionId)
+      : [];
+    const allAllowed = [...new Set([...baseTools, ...sessionTools])];
+    const allowedToolsArgs = allAllowed.map((t) => `"${t}"`).join(" ");
+    const cmd = `claude -c -p --output-format json --allowedTools ${allowedToolsArgs}`;
 
     console.log(`▶ Running: ${cmd}`);
     console.log(`  cwd: ${cwd}`);
@@ -191,7 +313,11 @@ function runClaudeContinue(prompt, cwd, timeoutSeconds) {
 
     const child = spawn("bash", ["-lc", cmd], {
       cwd: cwd,
-      env: { ...process.env, HOME: process.env.HOME },
+      env: {
+        ...process.env,
+        HOME: process.env.HOME,
+        PERMISSION_PORT: String(CONFIG.permissionPort),
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -351,6 +477,7 @@ const client = new Client({
 const sessions = new SessionTracker();
 const queue = new PromptQueue(CONFIG.maxQueueSize);
 const lock = new SecurityLock(CONFIG.passphrase, CONFIG.autoLockMinutes);
+const permissions = new PermissionManager();
 
 function isAuthorized(message) {
   if (message.author.bot) return false;
@@ -358,6 +485,262 @@ function isAuthorized(message) {
   if (CONFIG.channelId && message.channel.id !== CONFIG.channelId) return false;
   return true;
 }
+
+// ─── Permission UI ──────────────────────────────────────
+async function sendPermissionButtons(requestId, hookData) {
+  if (!CONFIG.channelId) {
+    console.log("⚠️ No NOTIFICATION_CHANNEL_ID set — auto-denying permission");
+    permissions.resolveRequest(requestId, { behavior: "deny" });
+    return;
+  }
+
+  const channel = client.channels.cache.get(CONFIG.channelId);
+  if (!channel) {
+    console.log("⚠️ Cannot find notification channel — auto-denying");
+    permissions.resolveRequest(requestId, { behavior: "deny" });
+    return;
+  }
+
+  const toolName = hookData.tool_name || "Unknown Tool";
+  const toolInput = hookData.tool_input || {};
+  const inputPreview =
+    typeof toolInput === "string"
+      ? toolInput.substring(0, 500)
+      : JSON.stringify(toolInput, null, 2).substring(0, 500);
+  const sessionId = hookData.session_id || "unknown";
+  const project = hookData.cwd ? path.basename(hookData.cwd) : "unknown";
+
+  const embed = new EmbedBuilder()
+    .setColor(0xffa500)
+    .setTitle(`🔐 Permission Request — ${toolName}`)
+    .setDescription(`\`\`\`json\n${inputPreview}\n\`\`\``)
+    .addFields(
+      { name: "📁 Project", value: project, inline: true },
+      {
+        name: "🔑 Session",
+        value: `\`${sessionId.substring(0, 12)}...\``,
+        inline: true,
+      },
+    )
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`perm_allow_${requestId}`)
+      .setLabel("Allow")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`perm_deny_${requestId}`)
+      .setLabel("Deny")
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`perm_allowall_${requestId}`)
+      .setLabel("Allow All")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`perm_modify_${requestId}`)
+      .setLabel("Modify")
+      .setStyle(ButtonStyle.Secondary),
+  );
+
+  const mention = CONFIG.allowedUserId ? `<@${CONFIG.allowedUserId}>` : "";
+  const msg = await channel.send({
+    content: mention,
+    embeds: [embed],
+    components: [row],
+  });
+  permissions.setDiscordMessage(requestId, msg);
+}
+
+// ─── Permission HTTP Server ─────────────────────────────
+let requestCounter = 0;
+
+function startPermissionServer() {
+  const server = http.createServer((req, res) => {
+    if (req.method !== "POST" || req.url !== "/permission-request") {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
+    }
+
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      let hookData;
+      try {
+        hookData = JSON.parse(body);
+      } catch {
+        res.writeHead(400);
+        res.end(
+          JSON.stringify(
+            wrapPermissionResponse({ behavior: "deny", message: "Invalid JSON" }),
+          ),
+        );
+        return;
+      }
+
+      const sessionId = hookData.session_id || "unknown";
+      const toolName = hookData.tool_name || "";
+
+      // Auto-allow base safe tools (Read, Grep, etc.) — no buttons needed
+      if (BASE_ALLOWED_TOOLS.has(toolName)) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(wrapPermissionResponse({ behavior: "allow" })));
+        return;
+      }
+
+      // Auto-allow if "Allow All" was previously used for this tool
+      if (permissions.isToolAllowed(sessionId, toolName)) {
+        console.log(`✅ Auto-allowing ${toolName} (session allow-all)`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(wrapPermissionResponse({ behavior: "allow" })));
+        return;
+      }
+
+      const requestId = `req_${Date.now()}_${++requestCounter}`;
+      console.log(
+        `🔐 Permission request ${requestId}: ${toolName} in ${sessionId.substring(0, 12)}...`,
+      );
+
+      permissions.createRequest(requestId, res, hookData);
+      sendPermissionButtons(requestId, hookData).catch((err) => {
+        console.error(`Failed to send permission buttons: ${err.message}`);
+        permissions.resolveRequest(requestId, { behavior: "deny" });
+      });
+    });
+  });
+
+  server.listen(CONFIG.permissionPort, "127.0.0.1", () => {
+    console.log(
+      `🔐 Permission server listening on 127.0.0.1:${CONFIG.permissionPort}`,
+    );
+  });
+
+  return server;
+}
+
+// ─── Interaction Handler (Buttons & Modals) ─────────────
+client.on(Events.InteractionCreate, async (interaction) => {
+  // Handle modal submissions
+  if (interaction.isModalSubmit()) {
+    if (!interaction.customId.startsWith("perm_modal_")) return;
+    const requestId = interaction.customId.replace("perm_modal_", "");
+    const req = permissions.getPending(requestId);
+    if (!req) {
+      await interaction.reply({ content: "Request expired.", ephemeral: true });
+      return;
+    }
+
+    const modifiedInput = interaction.fields.getTextInputValue("modified_input");
+    let parsedInput;
+    try {
+      parsedInput = JSON.parse(modifiedInput);
+    } catch {
+      await interaction.reply({
+        content: "Invalid JSON. Permission denied.",
+        ephemeral: true,
+      });
+      permissions.resolveRequest(requestId, { behavior: "deny" });
+      return;
+    }
+
+    permissions.resolveRequest(requestId, {
+      behavior: "allow",
+      updatedInput: parsedInput,
+    });
+
+    // Update the original message
+    if (req.discordMessage) {
+      try {
+        const embed = EmbedBuilder.from(req.discordMessage.embeds[0])
+          .setColor(0x57f287)
+          .setTitle(
+            `✏️ Permission Granted (Modified) — ${req.hookData.tool_name || "Tool"}`,
+          );
+        await req.discordMessage.edit({ embeds: [embed], components: [] });
+      } catch {}
+    }
+
+    await interaction.reply({
+      content: "Modified input approved.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Handle button clicks
+  if (!interaction.isButton()) return;
+  if (!interaction.customId.startsWith("perm_")) return;
+
+  // Auth check
+  if (interaction.user.id !== CONFIG.allowedUserId) {
+    await interaction.reply({
+      content: "You are not authorized.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const parts = interaction.customId.split("_");
+  const action = parts[1]; // allow, deny, allowall, modify
+  const requestId = parts.slice(2).join("_");
+
+  const req = permissions.getPending(requestId);
+  if (!req) {
+    await interaction.reply({
+      content: "This request has expired or was already handled.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const toolName = req.hookData.tool_name || "Unknown";
+  const sessionId = req.hookData.session_id || "unknown";
+
+  if (action === "allow") {
+    permissions.resolveRequest(requestId, { behavior: "allow" });
+    const embed = EmbedBuilder.from(req.discordMessage.embeds[0])
+      .setColor(0x57f287)
+      .setTitle(`✅ Permission Granted — ${toolName}`);
+    await interaction.update({ embeds: [embed], components: [] });
+  } else if (action === "deny") {
+    permissions.resolveRequest(requestId, { behavior: "deny" });
+    const embed = EmbedBuilder.from(req.discordMessage.embeds[0])
+      .setColor(0xed4245)
+      .setTitle(`❌ Permission Denied — ${toolName}`);
+    await interaction.update({ embeds: [embed], components: [] });
+  } else if (action === "allowall") {
+    permissions.allowTool(sessionId, toolName);
+    permissions.resolveRequest(requestId, { behavior: "allow" });
+    const embed = EmbedBuilder.from(req.discordMessage.embeds[0])
+      .setColor(0x57f287)
+      .setTitle(`✅ Permission Granted (All Future) — ${toolName}`);
+    await interaction.update({ embeds: [embed], components: [] });
+  } else if (action === "modify") {
+    const currentInput =
+      typeof req.hookData.tool_input === "string"
+        ? req.hookData.tool_input
+        : JSON.stringify(req.hookData.tool_input || {}, null, 2);
+
+    const modal = new ModalBuilder()
+      .setCustomId(`perm_modal_${requestId}`)
+      .setTitle(`Modify — ${toolName.substring(0, 30)}`);
+
+    const inputField = new TextInputBuilder()
+      .setCustomId("modified_input")
+      .setLabel("Tool Input (JSON)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setValue(currentInput.substring(0, 4000))
+      .setRequired(true);
+
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(inputField),
+    );
+    await interaction.showModal(modal);
+  }
+});
 
 // ─── Command Handlers ────────────────────────────────────
 const COMMANDS = {
@@ -370,6 +753,7 @@ const COMMANDS = {
   "!cancel": cmdCancel,
   "!lock": cmdLock,
   "!unlock": cmdUnlock,
+  "!permissions": cmdPermissions,
 };
 
 async function cmdHelp(message) {
@@ -394,6 +778,7 @@ async function cmdHelp(message) {
           "`!queue` — View pending jobs",
           "`!cancel` — Clear job queue",
           "`!lock` / `!unlock` — Passphrase lock",
+          "`!permissions` — View session-allowed tools",
         ].join("\n"),
       },
       {
@@ -472,8 +857,31 @@ async function cmdSwitch(message) {
 }
 
 async function cmdClear(message) {
+  const active = sessions.getActive();
+  if (active) permissions.clearSession(active.id);
   sessions.clear();
-  await message.reply("🧹 All sessions cleared.");
+  await message.reply("🧹 All sessions and permission overrides cleared.");
+}
+
+async function cmdPermissions(message) {
+  const active = sessions.getActive();
+  if (!active) {
+    await message.reply("No active session.");
+    return;
+  }
+  const allowed = permissions.getAllowedTools(active.id);
+  if (allowed.length === 0) {
+    await message.reply("No tools have been allowed-all for this session.");
+    return;
+  }
+  const embed = new EmbedBuilder()
+    .setColor(0x57f287)
+    .setTitle("🔐 Session Allowed Tools")
+    .setDescription(
+      allowed.map((t) => `• \`${t}\``).join("\n"),
+    )
+    .setFooter({ text: `Session: ${active.id.substring(0, 12)}...` });
+  await message.reply({ embeds: [embed] });
 }
 
 async function cmdQueue(message) {
@@ -587,6 +995,7 @@ client.on(Events.MessageCreate, async (message) => {
           prompt,
           cwd,
           CONFIG.claudeTimeout,
+          active.id,
         );
         console.log(
           `✅ Got response, text length: ${response.text.length}, sessionId: ${response.sessionId}`,
@@ -662,6 +1071,7 @@ client.once(Events.ClientReady, () => {
     `║  Passphrase: ${(CONFIG.passphrase ? "Enabled" : "Disabled").padEnd(32)}║`,
   );
   console.log(`║  Mode      : ${"claude -c -p (continue)".padEnd(32)}║`);
+  console.log(`║  Perm Port : ${String(CONFIG.permissionPort).padEnd(32)}║`);
   console.log("╠═══════════════════════════════════════════════╣");
   console.log("║  Waiting for hooks to report sessions...      ║");
   console.log("╚═══════════════════════════════════════════════╝");
@@ -669,11 +1079,14 @@ client.once(Events.ClientReady, () => {
 
 process.on("SIGINT", () => {
   client.destroy();
+  permissionServer.close();
   process.exit(0);
 });
 process.on("SIGTERM", () => {
   client.destroy();
+  permissionServer.close();
   process.exit(0);
 });
 
+const permissionServer = startPermissionServer();
 client.login(CONFIG.token);

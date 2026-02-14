@@ -21,8 +21,10 @@ echo ""
 mkdir -p "$HOOKS_DIR"
 cp "$SCRIPT_DIR/.claude/hooks/stop-notify.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/.claude/hooks/notification-notify.sh" "$HOOKS_DIR/"
+cp "$SCRIPT_DIR/.claude/hooks/permission-bridge.sh" "$HOOKS_DIR/"
 chmod +x "$HOOKS_DIR/stop-notify.sh"
 chmod +x "$HOOKS_DIR/notification-notify.sh"
+chmod +x "$HOOKS_DIR/permission-bridge.sh"
 echo "✅ Hook scripts copied to $HOOKS_DIR/"
 
 # 2. Check for jq (required by hooks)
@@ -69,6 +71,18 @@ if [ -f "$SETTINGS_FILE" ]; then
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/permission-bridge.sh",
+            "timeout": 600
+          }
+        ]
+      }
     ]
   }
 }
@@ -102,6 +116,18 @@ else
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/permission-bridge.sh",
+            "timeout": 600
+          }
+        ]
+      }
     ]
   }
 }
@@ -119,6 +145,7 @@ echo "Add to your ~/.bashrc, ~/.zshrc, or ~/.profile:"
 echo ""
 echo "  export DISCORD_WEBHOOK_URL=\"your_webhook_url\""
 echo "  export ALLOWED_USER_ID=\"your_discord_user_id\""
+echo "  export PERMISSION_PORT=\"3847\"  # optional, default 3847"
 echo ""
 echo "Then restart your shell: source ~/.zshrc"
 echo ""
