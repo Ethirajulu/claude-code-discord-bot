@@ -7,6 +7,12 @@
 
 INPUT=$(cat)
 
+# Only bridge to Discord when running from the bot
+if [ -z "$CLAUDE_DISCORD_BOT" ]; then
+  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}'
+  exit 0
+fi
+
 PORT="${PERMISSION_PORT:-3847}"
 
 RESPONSE=$(curl -s -f --max-time 590 \

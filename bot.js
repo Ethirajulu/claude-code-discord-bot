@@ -317,6 +317,7 @@ function runClaudeContinue(prompt, cwd, timeoutSeconds, sessionId) {
         ...process.env,
         HOME: process.env.HOME,
         PERMISSION_PORT: String(CONFIG.permissionPort),
+        CLAUDE_DISCORD_BOT: "1",
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
